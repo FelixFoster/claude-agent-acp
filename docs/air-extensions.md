@@ -17,6 +17,7 @@ It describes only this adapter.
 - [Claude tools and ACP fields](#claude-tools-and-acp-fields)
 - [Diff patch](#diff-patch)
 - [Plan file](#plan-file)
+- [Session hooks](#session-hooks)
 - [Permission presentation](#permission-presentation)
 - [Goal](#goal)
 - [Recommended config values](#recommended-config-values)
@@ -205,6 +206,20 @@ The adapter keeps them where they are.
 | `quota`                 | `PromptResponse._meta.quota`                                                                                                              | Token usage of the turn, also split by model.                                      |
 | `authStatus`            | `initialize` response `agentCapabilities._meta.authStatus`                                                                                | The agent pushes `_auth/status_update`. The object carries no payload.             |
 
+## Auth source display
+
+The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
+
+A command containing the whole word `central` and the word sequence `proxy start` is displayed as:
+
+```json
+{ "authStatus": { "kind": "gateway", "label": "JetBrains Air Gateway" } }
+```
+
+Matching is case-insensitive and accepts multiple whitespace characters between `proxy` and `start`. The command's flags, URL, host and route are not checked. This is a weak display heuristic, not proof of configuration provenance, account ownership or entitlement. Inactive helpers and external cloud backends retain their existing classification. No helper command, key, headers, private route or inferred account is included in this payload.
+
+Other active helpers use `label: "Anthropic API key"` and `detail: "API key helper"`; unknown key-source identifiers are not exposed as display text. CLI and SDK reads share this presentation, retain stale-probe protection, and suppress unchanged notifications.
+
 ## Zed conventions
 
 The adapter keeps these Zed and upstream conventions unchanged for every client.
@@ -214,6 +229,7 @@ An AIR client that declares `terminal_output_delta` gets appends instead of `ter
   A command tool call then has `content: [{type: "terminal", terminalId}]` and `_meta.terminal_info = {terminal_id}`.
   The output goes in `_meta.terminal_output = {terminal_id, data}`.
   The end sends `_meta.terminal_exit = {terminal_id, exit_code, signal: null}`.
+  A command that ends without a result (a cancel stopped its subagent, say) gets the exit on the report that closes its tool call, with no exit code (`null`; AIR gets `1`).
 - A client that declares neither `terminal_output` nor `terminal_output_delta` gets no terminal.
   The command output is a `console` code block in `content`.
 - A client that declares `clientCapabilities._meta["terminal-auth"]: true` gets `_meta["terminal-auth"] = {command, args, label}` on the terminal login methods.
@@ -495,6 +511,21 @@ The plan text goes out as before in these cases:
 `rawInput` then is the SDK input with `plan`, and the input `planFilePath` when it is present.
 AIR then shows the in-memory `plan` text.
 A client that is not AIR always gets the whole SDK input, like upstream.
+
+## Session hooks
+
+The adapter accepts session hooks from any client, without a capability.
+AIR puts the hooks into `_meta.claudeCode.options.settings.hooks` of `session/new` and `session/load`:
+
+```json
+{ "claudeCode": { "options": { "settings": { "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "..." }] }] } } } }
+```
+
+- The settings go to the flag settings tier of that session only. Other sessions and the settings files do not change.
+- Claude Code runs the hooks of every settings tier, so the user, project and IDE hooks of one event all run. `src/tests/session-hooks.test.ts` checks this with the Claude Code binary.
+- `CLAUDE_MODEL_CONFIG` stays in effect (see [Model configuration](model-configuration.md#precedence)).
+- A `session/load` with different settings recreates the query, so it applies the new hooks.
+- Claude asks for no hook trust step.
 
 ## Permission presentation
 
@@ -1170,8 +1201,9 @@ This section covers only the AIR bridge.
 - The canonical client field is `clientCapabilities.subagents: {}`.
 - Released ACP SDKs can strip that draft field.
   AIR can instead declare `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`.
-- Either signal enables native subagent sessions. The canonical field takes precedence when it is available.
-- The agent advertises `nativeSubagentSessions` to AIR, and `agentCapabilities.sessionCapabilities.subagents` to every client.
+- Either signal enables native subagent sessions, and AIR gets this earlier draft of the RFD whichever it declares.
+- The agent advertises `nativeSubagentSessions` and `agentCapabilities.sessionCapabilities.subagents` to AIR.
+- A client that is not AIR and declares `clientCapabilities.subagents` gets the revised RFD instead (`subagent_update`, `session_message`), see the README.
 - With native sessions, the adapter sends `subagent_spawned` and `subagent_state_update`.
   The child output goes to the child session. The Agent or Task tool call is not the subagent card.
 - `subagent_spawned` can carry an optional `prompt`: the exact prompt of the child session.
@@ -1391,7 +1423,8 @@ It is idempotent, and an unknown id also returns `{}`.
 - a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete. Anything left behind fails the request. A session that runs here is closed first. As with the CLI, the session is deleted also when another Claude Code process has it open. An unknown session is `-32002`.
 - an AIR client without `sessionIndex`: archives the session instead of deleting it (the title records of [Archive](#archive)), because AIR uses delete for "Done" and can reopen the session. A session that runs here is closed first. The list hides archived sessions from such a client too: those whose custom title, as the SDK list reports it, is archived. A session without a transcript fails with the error of the SDK delete, as before.
   A `sessionIndex` client sees such a session as archived (`archived: true`), as AIR's native Claude path does.
-- any other client: the SDK delete, as before.
+- any other client: the SDK delete. A session without a transcript (unknown, deleted before, or
+  never prompted) succeeds, as ACP asks.
 
 `session/close` of a session that is not loaded returns `{}` for every client.
 
@@ -1525,6 +1558,8 @@ It adds this object to the `session/fork` request:
   When only one stored message has the fingerprint, the adapter uses that message.
 - When no message matches, the request fails with `invalidParams`.
 - The fork keeps the history up to that message.
+- With or without this object, the forked session runs once the response arrives, so the client can prompt it without `session/load` or `session/resume`.
+  A later load replays its history into it, and a later resume returns it. A load or resume with other settings (`cwd`, MCP servers, additional directories, or the session options in `_meta`) restarts it, as for any loaded session.
 
 ## Presentation hints
 

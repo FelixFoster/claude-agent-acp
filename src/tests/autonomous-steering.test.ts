@@ -35,16 +35,25 @@ function request(text = "also handle this"): SteerRequest {
   };
 }
 
-async function setup(onUpdate?: (notification: any) => void) {
+async function setup(onUpdate?: (notification: any) => void | Promise<void>) {
   const updates: any[] = [];
+  const foreground: string[] = [];
   const agent = new ClaudeAcpAgent(
     {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
-        onUpdate?.(notification);
+        await onUpdate?.(notification);
       },
     } as AcpClient,
     { log() {}, error() {} },
+    {
+      foreground: () => ({
+        running: () => foreground.push("running"),
+        awaitingUser: () => foreground.push("awaitingUser"),
+        ended: (outcome) => foreground.push(`ended ${outcome.stopReason}`),
+        failed: () => foreground.push("failed"),
+      }),
+    },
   );
   const input = new Pushable<any>();
   const outgoing = input[Symbol.asyncIterator]();
@@ -72,7 +81,8 @@ async function setup(onUpdate?: (notification: any) => void) {
   cleanups.push(close);
   const prompt = vi.spyOn(agent, "prompt");
   const inputPush = vi.spyOn(input, "push");
-  return { agent, session, send, outgoing, prompt, inputPush, updates, close };
+  foreground.length = 0;
+  return { agent, session, send, outgoing, prompt, inputPush, updates, close, foreground };
 }
 
 describe("steering an autonomous cycle", () => {
@@ -112,11 +122,11 @@ describe("steering an autonomous cycle", () => {
   it("uses later while an autonomous cycle awaits user input", async () => {
     const { agent, session, send, inputPush } = await setup();
     await send(state("running"));
-    session.pendingUserInputCount = 1;
+    session.openUserInputs = new Set([{}]);
     await send(state("requires_action"));
     await expect(agent.steer(request())).resolves.toEqual({ outcome: "injected" });
     expect(inputPush.mock.calls[0][0].priority).toBe("later");
-    expect(session.pendingUserInputCount).toBe(1);
+    expect(session.openUserInputs.size).toBe(1);
   });
 
   it.each(["idle", "result", "cancel", "abort", "no-consumer"])(
@@ -412,17 +422,25 @@ describe("steering an autonomous cycle", () => {
     }
   });
 
-  it("does not trust buffered running states after worker shutdown", async () => {
-    const { agent, send, prompt } = await setup();
-    await send(state("running"));
-    await send({ type: "system", subtype: "worker_shutting_down" });
-    await send(state("running"));
-    await expect(agent.steer(request())).resolves.toEqual({
-      outcome: "promptRequired",
-      reason: "noRunningTurn",
-    });
-    expect(prompt).not.toHaveBeenCalled();
-  });
+  it.each(["running", "requesting"])(
+    "does not trust buffered %s frames after worker shutdown",
+    async (frame) => {
+      const { agent, session, send, prompt } = await setup();
+      session.requestMarkerListsV1 = true;
+      await send(state("running"));
+      await send({ type: "system", subtype: "worker_shutting_down" });
+      await send(
+        frame === "running"
+          ? state("running")
+          : { type: "system", subtype: "status", status: "requesting", user_message_uuids: [] },
+      );
+      await expect(agent.steer(request())).resolves.toEqual({
+        outcome: "promptRequired",
+        reason: "noRunningTurn",
+      });
+      expect(prompt).not.toHaveBeenCalled();
+    },
+  );
 
   it("rejects after the consumer disconnects and releases command ownership", async () => {
     const { agent, send, session, close } = await setup();
@@ -497,6 +515,24 @@ describe("steering an autonomous cycle", () => {
     );
     await next;
     expect(session.pendingGoalUpdate.commandUuid).toBe(steered.uuid);
+    expect(session.lastPublishedGoal.objective).toBe("replacement");
+    await send(successfulResultMessage({ user_message_uuid: steered.uuid }));
+    expect(session.pendingGoalUpdate).toBeUndefined();
+  });
+
+  it("does not roll back an autonomous goal for a newer prompt's unstamped error", async () => {
+    const { agent, send, outgoing, session } = await setup();
+    session.lastPublishedGoal = { objective: "original", status: "active" };
+    await send(state("running"));
+    await agent.steer(request("/goal replacement"));
+    const steered = (await outgoing.next()).value;
+    await send(userEcho(steered));
+    const next = agent.prompt(request("next")).catch(() => undefined);
+    const nextMessage = (await outgoing.next()).value;
+    await send(userEcho(nextMessage));
+    await send(successfulResultMessage({ is_error: true, result: "Next failed" }));
+    await next;
+    expect(session.pendingGoalUpdate?.commandUuid).toBe(steered.uuid);
     expect(session.lastPublishedGoal.objective).toBe("replacement");
     await send(successfulResultMessage({ user_message_uuid: steered.uuid }));
     expect(session.pendingGoalUpdate).toBeUndefined();
@@ -653,6 +689,259 @@ describe("steering an autonomous cycle", () => {
     await result;
     expect(replacement.lastPublishedGoal).toEqual(replacementGoal);
     expect(updates.some(({ update }) => update.content?.text === "Stale error")).toBe(false);
+  });
+
+  it("keeps foreground ownership with a prompt that takes over an autonomous steer", async () => {
+    const { agent, send, outgoing, foreground } = await setup();
+    await send(state("running"));
+    await send({
+      type: "stream_event",
+      parent_tool_use_id: null,
+      uuid: "autonomous-output",
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "Autonomous work" },
+      },
+    });
+    await agent.steer(request());
+    const steered = (await outgoing.next()).value;
+    await send(userEcho(steered));
+    const next = agent.prompt(request("next"));
+    const nextMessage = (await outgoing.next()).value;
+    await send(userEcho(nextMessage));
+    expect(foreground).toEqual(["running"]);
+    await send(successfulResultMessage({ user_message_uuid: steered.uuid }));
+    await send(state("idle"));
+    expect(foreground).toEqual(["running"]);
+    await send(successfulResultMessage({ user_message_uuid: nextMessage.uuid }));
+    await next;
+    expect(foreground).toEqual(["running", "ended end_turn"]);
+  });
+
+  it("does not end replacement foreground work at a stale steer result or old consumer EOF", async () => {
+    const { agent, send, outgoing, session, foreground, close } = await setup();
+    await send(state("running"));
+    await agent.steer(request());
+    const steered = (await outgoing.next()).value;
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    vi.spyOn(session.asyncTaskRuntime, "releaseHeld").mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    const result = send(successfulResultMessage({ user_message_uuid: steered.uuid }));
+    await entered.promise;
+    const replacement = mockSessionState();
+    agent.sessions["test-session"] = replacement;
+    // The replacement consumer's first main-conversation output starts its cycle.
+    (agent as any).startAutonomousCycle("test-session", replacement, {
+      type: "stream_event",
+      parent_tool_use_id: null,
+    });
+    release.resolve();
+    await result;
+    expect(foreground).toEqual(["running"]);
+    await close();
+    expect(foreground).toEqual(["running"]);
+    (agent as any).endAutonomousCycle("test-session", { outcome: { stopReason: "end_turn" } });
+    expect(foreground).toEqual(["running", "ended end_turn"]);
+  });
+
+  it.each(["idle", "result"])(
+    "keeps replacement foreground work running when %s tool cleanup yields",
+    async (boundary) => {
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const { agent, session, send, outgoing, foreground } = await setup(async ({ update }) => {
+        if (update.sessionUpdate === "tool_call_update" && update.toolCallId === "unfinished") {
+          entered.resolve();
+          await release.promise;
+        }
+      });
+      await send(state("running"));
+      await agent.steer(request());
+      const steered = (await outgoing.next()).value;
+      await send({
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: "autonomous-output",
+        session_id: "test-session",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "Autonomous work" },
+        },
+      });
+      // A streamed tool that never ran must close before the cycle ends.
+      session.emittedToolCalls.add("unfinished");
+      const ending = send(
+        boundary === "idle"
+          ? state("idle")
+          : successfulResultMessage({ user_message_uuid: steered.uuid }),
+      );
+      await entered.promise;
+      expect(foreground).toEqual(["running"]);
+      expect(session.emittedToolCalls.has("unfinished")).toBe(false);
+      // Teardown replaces the query while its last tool report is in flight.
+      (agent as any).endAutonomousCycle("test-session", { outcome: { stopReason: "cancelled" } });
+      const replacement = mockSessionState();
+      agent.sessions["test-session"] = replacement;
+      (agent as any).startAutonomousCycle("test-session", replacement, {
+        type: "stream_event",
+        parent_tool_use_id: null,
+      });
+      release.resolve();
+      await ending;
+      expect(foreground).toEqual(["running", "ended cancelled", "running"]);
+      (agent as any).endAutonomousCycle("test-session", { outcome: { stopReason: "end_turn" } });
+      expect(foreground).toEqual(["running", "ended cancelled", "running", "ended end_turn"]);
+    },
+  );
+
+  it("records cancelled autonomous UUIDs before awaiting compaction interruption", async () => {
+    const { agent, session, send, outgoing } = await setup();
+    session.requestMarkerListsV1 = true;
+    await send(state("running"));
+    await agent.steer(request());
+    const steered = (await outgoing.next()).value;
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    vi.spyOn(session.contextCompaction, "interrupt").mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    const openInput = {};
+    session.openUserInputs = new Set([openInput]);
+    const cancel = agent.cancel({ sessionId: "test-session" });
+    await entered.promise;
+    expect(openInput).toEqual({ cancelled: true });
+    try {
+      await send({
+        type: "system",
+        subtype: "status",
+        status: "requesting",
+        user_message_uuids: [steered.uuid],
+      });
+      expect(session.cancelled).toBe(true);
+      expect(session.cancelledPrompts).toContain(steered.uuid);
+    } finally {
+      release.resolve();
+      await cancel;
+    }
+  });
+
+  it("can steer a fresh autonomous request after cancellation without a repeated running state", async () => {
+    const { agent, session, send, outgoing, prompt } = await setup();
+    session.requestMarkerListsV1 = true;
+    await send(state("running"));
+    await agent.steer(request());
+    const steered = (await outgoing.next()).value;
+    await agent.cancel({ sessionId: "test-session" });
+    await send(successfulResultMessage({ user_message_uuid: steered.uuid }));
+    // Claude Code may stay running while background tasks remain alive.
+    expect(session.lastSessionState).toBe("running");
+    await send({
+      type: "system",
+      subtype: "status",
+      status: "requesting",
+      user_message_uuids: [],
+    });
+    expect(session.cancelled).toBe(false);
+    await expect(agent.steer(request("steer recovered follow-up"))).resolves.toEqual({
+      outcome: "injected",
+    });
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "filters cancelled steering output and gates autonomous recovery on request markers (%s)",
+    async (requestMarkers) => {
+      const { agent, session, send, outgoing, updates, foreground } = await setup();
+      session.requestMarkerListsV1 = requestMarkers;
+      const output = async (text: string) => {
+        await send({
+          type: "stream_event",
+          parent_tool_use_id: null,
+          uuid: `start-${text}`,
+          session_id: "test-session",
+          event: {
+            type: "message_start",
+            message: {
+              id: `message-${text}`,
+              role: "assistant",
+              content: [],
+              model: "claude-sonnet-4-20250514",
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
+          },
+        });
+        await send({
+          type: "stream_event",
+          parent_tool_use_id: null,
+          uuid: `delta-${text}`,
+          session_id: "test-session",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text },
+          },
+        });
+      };
+      await send(state("running"));
+      await agent.steer(request());
+      const steered = (await outgoing.next()).value;
+      await output("Before cancellation");
+      await agent.cancel({ sessionId: "test-session" });
+      await send(successfulResultMessage({ user_message_uuid: steered.uuid }));
+      await send({
+        type: "system",
+        subtype: "status",
+        status: "requesting",
+        user_message_uuids: [steered.uuid],
+      });
+      await output("Cancelled command output");
+      expect(session.cancelled).toBe(true);
+      await expect(agent.steer(request())).resolves.toEqual({
+        outcome: "promptRequired",
+        reason: "noRunningTurn",
+      });
+      await send({
+        type: "system",
+        subtype: "status",
+        status: "requesting",
+        user_message_uuids: [],
+      });
+      await output("Fresh follow-up output");
+      expect(session.cancelled).toBe(!requestMarkers);
+      expect(
+        updates
+          .filter(({ update }) => update.sessionUpdate === "agent_message_chunk")
+          .map(({ update }) => update.content.text),
+      ).toEqual(
+        requestMarkers
+          ? ["Before cancellation", "Fresh follow-up output"]
+          : ["Before cancellation"],
+      );
+      expect(foreground).toEqual(
+        requestMarkers ? ["running", "ended cancelled", "running"] : ["running", "ended cancelled"],
+      );
+    },
+  );
+
+  it("can steer a subsequent autonomous model request without a repeated running state", async () => {
+    const { agent, session, send } = await setup();
+    session.requestMarkerListsV1 = true;
+    await send(state("running"));
+    await send(successfulResultMessage({ origin: { kind: "task-notification" } }));
+    await send({
+      type: "system",
+      subtype: "status",
+      status: "requesting",
+      user_message_uuids: [],
+    });
+    await expect(agent.steer(request())).resolves.toEqual({ outcome: "injected" });
   });
 
   it("processes cancellation during an autonomous buffered backlog before accepting another steer", async () => {

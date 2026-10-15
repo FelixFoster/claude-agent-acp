@@ -20,6 +20,10 @@ export class AutonomousSteering {
     }
   }
 
+  owns(uuid: string): boolean {
+    return this.commands.has(uuid);
+  }
+
   add(uuid: string): void {
     this.commands.set(uuid, {
       started: false,
