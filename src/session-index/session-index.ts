@@ -52,8 +52,9 @@ import {
   type SdkTitles,
   type TranscriptFacts,
 } from "./transcript-scan.js";
+import { searchBackgroundTasks } from "./background-tasks.js";
 import { DirListings, statFiles } from "./dir-listing.js";
-import { worktreeCounterparts } from "./worktrees.js";
+import { isInLinkedWorktree, worktreeCounterparts } from "./worktrees.js";
 
 export const DEFAULT_LIST_LIMIT = 50;
 export const MAX_LIST_LIMIT = 200;
@@ -125,6 +126,10 @@ export type IndexRow = {
   facts: TranscriptFacts;
   mtimeMs: number;
   archived: boolean;
+  /** The session runs in a linked git worktree that Claude Code made for
+   *  it: its transcript says so (`facts.agentWorktree`) and `cwd` lies in
+   *  a linked worktree. See {@link markAgentWorktrees}. */
+  agentWorktree?: true;
 };
 
 /** A keyset position: the order key and the session id of the last row. */
@@ -247,6 +252,22 @@ function toRow({ candidate, metadata }: Resolved, cwd: string): IndexRow {
     facts: metadata.facts,
     mtimeMs: candidate.mtimeMs,
   };
+}
+
+/**
+ * Sets `agentWorktree` on the rows whose transcript says Claude Code made
+ * their worktree and whose cwd lies in a linked worktree now. Only those rows
+ * are checked; the check is not cached, so a removed worktree shows at once.
+ */
+async function markAgentWorktrees(rows: IndexRow[]): Promise<IndexRow[]> {
+  await Promise.all(
+    rows.map(async (row) => {
+      if (row.facts.agentWorktree === true && (await isInLinkedWorktree(row.cwd))) {
+        row.agentWorktree = true;
+      }
+    }),
+  );
+  return rows;
 }
 
 function isAfter(row: { orderAtMs: number; sessionId: string }, cursor: ListCursor): boolean {
@@ -380,7 +401,15 @@ function scopeOf(
   };
 }
 
+export type SessionIndexOptions = {
+  /** Whether a live process holds the session. Only for such a session the
+   *  whole transcript is searched for its background tasks. */
+  isLive?: (sessionId: string) => Promise<boolean>;
+};
+
 export class SessionIndex {
+  constructor(private readonly options: SessionIndexOptions = {}) {}
+
   private readonly listings = new DirListings();
   private readonly metadata = new Lru<string, CacheEntry>(METADATA_CACHE_SIZE);
   /** The metadata reads in flight, by path: a list and a subscription that
@@ -686,11 +715,14 @@ export class SessionIndex {
    * alone gives, read from it at once, and the ids of the sessions it gives
    * no answer for: a transcript of it has nothing cached at its stat, no cwd
    * known, or is continued in another session (whether the successor hides
-   * it depends on the successor now). Reads no transcript.
+   * it depends on the successor now). Reads no transcript. The rows carry
+   * `agentWorktree` ({@link markAgentWorktrees}, which reads git files)
+   * unless `mark` is false, for a caller that uses only their ids.
    */
   async cachedRowsOf(
     paths: readonly string[],
     candidates: readonly TranscriptCandidate[],
+    { mark = true }: { mark?: boolean } = {},
   ): Promise<{ rows: IndexRow[]; unknown: Set<string> }> {
     const unknown = new Set<string>();
     const resolved: { item: Resolved; cwd: string }[] = [];
@@ -721,7 +753,8 @@ export class SessionIndex {
       if (previous && previous.mtimeMs >= item.candidate.mtimeMs) continue;
       newest.set(id, { row: toRow(item, cwd), mtimeMs: item.candidate.mtimeMs });
     }
-    return { rows: [...newest.values()].map(({ row }) => row), unknown };
+    const rows = [...newest.values()].map(({ row }) => row);
+    return { rows: mark ? await markAgentWorktrees(rows) : rows, unknown };
   }
 
   /**
@@ -831,7 +864,7 @@ export class SessionIndex {
       );
       await settlePending();
     }
-    return rows();
+    return markAgentWorktrees(rows());
   }
 
   /** Whether the cached metadata of `candidate`, still current, places it
@@ -968,14 +1001,15 @@ export class SessionIndex {
     this.reads++;
     const headTail = await readHeadTail(candidate.filePath, candidate.size);
     if (isSidechainTranscript(headTail.head)) return null;
-    const facts = await scanTranscriptFile(
+    const scanned = await scanTranscriptFile(
       candidate.filePath,
       candidate.size,
       headTail,
       previous,
       candidate.ino,
     );
-    if (!facts.hasMessages) return null;
+    if (!scanned.hasMessages) return null;
+    const facts = await this.withAllBackgroundTasks(candidate, scanned);
     // The last relocation names the session's cwd, as the SDK reads it; the
     // messages before it keep the old one.
     const fileCwd = await this.recoverCwd(candidate.dirName, [
@@ -1006,6 +1040,24 @@ export class SessionIndex {
       updatedAtMs: Math.min(lastMessageAt, candidate.mtimeMs),
       facts,
     };
+  }
+
+  /**
+   * `facts` with the background tasks of the whole transcript, when the
+   * tasks of its tail are not complete: a task can start before the tail.
+   * Only a finished turn of a live session waits for the tasks, so only
+   * then the whole transcript is read.
+   */
+  private async withAllBackgroundTasks(
+    candidate: TranscriptCandidate,
+    facts: TranscriptFacts,
+  ): Promise<TranscriptFacts> {
+    if (facts.turnState !== "finished") return facts;
+    if (facts.backgroundTasks?.complete) return facts;
+    const isLive = await this.options.isLive?.(candidate.sessionId);
+    if (!isLive) return facts;
+    const backgroundTasks = await searchBackgroundTasks(candidate.filePath, candidate.size);
+    return { ...facts, backgroundTasks };
   }
 
   /**

@@ -35,7 +35,7 @@ function request(text = "also handle this"): SteerRequest {
   };
 }
 
-async function setup(onUpdate?: (notification: any) => void | Promise<void>) {
+async function setup(onUpdate?: (notification: any) => void | Promise<void>, asyncTasks = false) {
   const updates: any[] = [];
   const foreground: string[] = [];
   const agent = new ClaudeAcpAgent(
@@ -55,13 +55,19 @@ async function setup(onUpdate?: (notification: any) => void | Promise<void>) {
       }),
     },
   );
+  if (asyncTasks) {
+    agent.clientCapabilities = {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+    };
+  }
   const input = new Pushable<any>();
   const outgoing = input[Symbol.asyncIterator]();
-  const frames = new Pushable<{ message: any; consumed: () => void }>();
+  const frames = new Pushable<{ message: any; consumed: () => void } | { error: Error }>();
   async function* messages() {
-    for await (const { message, consumed } of frames) {
-      yield message;
-      consumed();
+    for await (const frame of frames) {
+      if ("error" in frame) throw frame.error;
+      yield frame.message;
+      frame.consumed();
     }
   }
   const session = mockSessionState({ input, query: wrapQuery(messages()) });
@@ -78,11 +84,15 @@ async function setup(onUpdate?: (notification: any) => void | Promise<void>) {
     frames.end();
     await session.consumer;
   };
+  const fail = async (error = new Error("Query stream failed")) => {
+    frames.push({ error });
+    await session.consumer;
+  };
   cleanups.push(close);
   const prompt = vi.spyOn(agent, "prompt");
   const inputPush = vi.spyOn(input, "push");
   foreground.length = 0;
-  return { agent, session, send, outgoing, prompt, inputPush, updates, close, foreground };
+  return { agent, session, send, outgoing, prompt, inputPush, updates, close, fail, foreground };
 }
 
 describe("steering an autonomous cycle", () => {
@@ -102,6 +112,166 @@ describe("steering an autonomous cycle", () => {
     );
     expect(session.turnQueue).toEqual([]);
     expect(session.activeTurn).toBeNull();
+  });
+
+  it("does not present an autonomous steer's human-origin echo as a remote message", async () => {
+    const { agent, session, send, outgoing, updates } = await setup();
+    await send(state("running"));
+    await agent.steer(request());
+    const steered = (await outgoing.next()).value;
+    expect(session.sentUserUuids.has(steered.uuid)).toBe(true);
+    await send({ ...userEcho(steered), origin: { kind: "human" } });
+    expect(session.sentUserUuids.has(steered.uuid)).toBe(false);
+    expect(updates.filter(({ update }) => update.sessionUpdate === "user_message_chunk")).toEqual(
+      [],
+    );
+  });
+
+  it.each([false, true])(
+    "ends the async task at a steer-owned result (error: %s)",
+    async (isError) => {
+      const { agent, send, outgoing, updates } = await setup(undefined, true);
+      await send(state("running"));
+      const spawned = updates.find(
+        ({ update }) => update.sessionUpdate === "async_task_spawned",
+      )!.update;
+      await agent.steer(request());
+      const steered = (await outgoing.next()).value;
+      await send(successfulResultMessage({ origin: { kind: "task-notification" }, num_turns: 0 }));
+      expect(
+        updates.filter(({ update }) => update.sessionUpdate === "async_task_state_update"),
+      ).toEqual([]);
+      await send(
+        successfulResultMessage({
+          origin: { kind: "human" },
+          user_message_uuid: steered.uuid,
+          is_error: isError,
+          result: isError ? "Steered request failed" : "",
+        }),
+      );
+      expect(
+        updates
+          .filter(({ update }) => update.sessionUpdate === "async_task_state_update")
+          .map(({ update }) => update),
+      ).toEqual([
+        {
+          sessionUpdate: "async_task_state_update",
+          asyncTaskId: spawned.asyncTaskId,
+          state: isError ? "failed" : "completed",
+        },
+      ]);
+    },
+  );
+
+  it("closes autonomous steering before awaiting an async-task stop", async () => {
+    const { agent, session, send, outgoing, updates } = await setup(undefined, true);
+    session.requestMarkerListsV1 = true;
+    await send(state("running"));
+    const task = updates.find(
+      ({ update }) => update.sessionUpdate === "async_task_spawned",
+    )!.update;
+    await agent.steer(request());
+    const steered = (await outgoing.next()).value;
+    let release = () => {};
+    const interrupted = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.mocked(session.query.interrupt).mockImplementationOnce(() => interrupted);
+    const stop = agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: task.asyncTaskId });
+    try {
+      await send({
+        type: "system",
+        subtype: "status",
+        status: "requesting",
+        user_message_uuids: [steered.uuid],
+      });
+      await send(state("running"));
+      await expect(agent.steer(request())).resolves.toEqual({
+        outcome: "promptRequired",
+        reason: "noRunningTurn",
+      });
+    } finally {
+      release();
+    }
+    await expect(stop).resolves.toEqual({ stopped: true });
+    const transcriptBeforeResult = updates.filter(
+      ({ update }) => update.sessionUpdate === "agent_message_chunk",
+    );
+    await send(
+      successfulResultMessage({
+        origin: { kind: "human" },
+        user_message_uuid: steered.uuid,
+        is_error: true,
+        result: "Expected interrupted steer failure",
+      }),
+    );
+    expect(updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk")).toEqual(
+      transcriptBeforeResult,
+    );
+    expect(session.lastTurnFailed).not.toBe(true);
+    expect(session.query.stopTask).not.toHaveBeenCalled();
+    await send({ type: "system", subtype: "status", status: "requesting", user_message_uuids: [] });
+    await expect(agent.steer(request())).resolves.toEqual({ outcome: "injected" });
+    expect(
+      updates
+        .filter(({ update }) => update.sessionUpdate === "async_task_state_update")
+        .map(({ update }) => update.state),
+    ).toEqual(["stopped"]);
+  });
+
+  it("recovers steering on fresh work after an async-task interrupt rejects", async () => {
+    const { agent, session, send, outgoing, updates } = await setup(undefined, true);
+    session.requestMarkerListsV1 = true;
+    await send(state("running"));
+    const task = updates.find(
+      ({ update }) => update.sessionUpdate === "async_task_spawned",
+    )!.update;
+    await agent.steer(request());
+    const steered = (await outgoing.next()).value;
+    vi.mocked(session.query.interrupt).mockRejectedValueOnce(
+      new Error("Interrupt transport failed"),
+    );
+    await expect(
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: task.asyncTaskId }),
+    ).rejects.toThrow("Interrupt transport failed");
+    // A rejected interrupt has an uncertain outcome. Do not inject into its
+    // old work; a fresh request that names no cancelled command reopens it.
+    await send({
+      type: "system",
+      subtype: "status",
+      status: "requesting",
+      user_message_uuids: [steered.uuid],
+    });
+    await expect(agent.steer(request())).resolves.toEqual({
+      outcome: "promptRequired",
+      reason: "noRunningTurn",
+    });
+    await send(successfulResultMessage({ user_message_uuid: steered.uuid }));
+    await send({ type: "system", subtype: "status", status: "requesting", user_message_uuids: [] });
+    await expect(agent.steer(request())).resolves.toEqual({ outcome: "injected" });
+  });
+
+  it("leaves steering ownership untouched when an async-task stop refuses a queued prompt", async () => {
+    const { agent, session, send, outgoing, updates } = await setup(undefined, true);
+    await send(state("running"));
+    const task = updates.find(
+      ({ update }) => update.sessionUpdate === "async_task_spawned",
+    )!.update;
+    await agent.steer(request());
+    const steered = (await outgoing.next()).value;
+    const prompt = agent.prompt(request("next prompt"));
+    const queued = (await outgoing.next()).value;
+    await expect(
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: task.asyncTaskId }),
+    ).resolves.toEqual({ stopped: false });
+    expect(session.cancelled).toBe(false);
+    expect(session.cancelledPrompts).toBeUndefined();
+    expect(session.autonomousSteering.isRunning).toBe(true);
+    expect(session.autonomousSteering.owns(steered.uuid)).toBe(true);
+    expect(session.query.interrupt).not.toHaveBeenCalled();
+    await send(userEcho(queued));
+    await send(successfulResultMessage({ user_message_uuid: queued.uuid }));
+    await prompt;
   });
 
   it.each([undefined, "promptRequired"] as const)(
@@ -748,6 +918,82 @@ describe("steering an autonomous cycle", () => {
     (agent as any).endAutonomousCycle("test-session", { outcome: { stopReason: "end_turn" } });
     expect(foreground).toEqual(["running", "ended end_turn"]);
   });
+
+  it.each([false, true])(
+    "ends an autonomous cycle after stream death with cancelled=%s",
+    async (cancelled) => {
+      const { agent, session, send, fail, foreground } = await setup();
+      await send(state("running"));
+      (agent as any).startAutonomousCycle("test-session", session, {
+        type: "stream_event",
+        parent_tool_use_id: null,
+      });
+      // Hold cancel before it ends the cycle, so the stream error owns settlement.
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let cancel: Promise<void> | undefined;
+      if (cancelled) {
+        vi.spyOn(session.contextCompaction, "interrupt").mockImplementationOnce(async () => {
+          entered.resolve();
+          await release.promise;
+        });
+        cancel = agent.cancel({ sessionId: "test-session" });
+        await entered.promise;
+      }
+      try {
+        await fail();
+        expect(session.queryClosed).toBe(true);
+        expect(foreground).toEqual(["running", cancelled ? "ended cancelled" : "failed"]);
+      } finally {
+        release.resolve();
+        await cancel;
+      }
+      expect(foreground).toEqual(["running", cancelled ? "ended cancelled" : "failed"]);
+    },
+  );
+
+  it("preserves the cancelled active turn when stream-death settlement fails", async () => {
+    const { agent, session, send, outgoing, fail } = await setup();
+    const active = agent.prompt(request("active"));
+    const activeMessage = (await outgoing.next()).value;
+    await send(userEcho(activeMessage));
+    await agent.cancel({ sessionId: "test-session" });
+    // This prompt arrived after cancel's queue sweep and was never cancelled.
+    const queued = agent.prompt(request("after cancel"));
+    await outgoing.next();
+    const queuedFailure = expect(queued).rejects.toThrow("Query stream failed");
+    session.fileChangeReporter = {
+      finish: vi.fn().mockImplementationOnce(() => {
+        throw new Error("Checkpoint finalization failed");
+      }),
+    };
+    await fail();
+    await queuedFailure;
+    await expect(active).resolves.toMatchObject({ stopReason: "cancelled" });
+    expect(session.fileChangeReporter.finish).toHaveBeenCalledTimes(3);
+    expect(session.activeTurn).toBeNull();
+    expect(session.turnQueue).toEqual([]);
+  });
+
+  it.each([false, true])(
+    "does not end replacement foreground work when a stale consumer fails (cancelled=%s)",
+    async (cancelled) => {
+      const { agent, session, fail, foreground } = await setup();
+      session.cancelled = cancelled;
+      const replacement = mockSessionState();
+      agent.sessions["test-session"] = replacement;
+      (agent as any).startAutonomousCycle("test-session", replacement, {
+        type: "stream_event",
+        parent_tool_use_id: null,
+      });
+      await fail();
+      expect(session.queryClosed).toBe(true);
+      expect(agent.sessions["test-session"]).toBe(replacement);
+      expect(foreground).toEqual(["running"]);
+      (agent as any).endAutonomousCycle("test-session", { outcome: { stopReason: "end_turn" } });
+      expect(foreground).toEqual(["running", "ended end_turn"]);
+    },
+  );
 
   it.each(["idle", "result"])(
     "keeps replacement foreground work running when %s tool cleanup yields",

@@ -56,7 +56,7 @@ import {
   WriteTextFileRequest,
   WriteTextFileResponse,
   ToolCallContent,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
 import {
   AccountInfo,
@@ -88,6 +88,7 @@ import {
   SDKPartialAssistantMessage,
   SessionMessage,
   SDKUserMessage,
+  SDKUserMessageReplay,
   Settings,
   SlashCommand,
   ThinkingConfig,
@@ -104,6 +105,7 @@ import {
   parseGoalRequest,
   toGoalSnapshot,
 } from "./goal-extension.js";
+import { promptSuggestionsMeta, promptSuggestionText } from "./prompt-suggestions.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
@@ -132,6 +134,8 @@ import {
   AIR_PLAN_FILE_CAPABILITY,
   AIR_GOAL_KEY,
   AIR_KIND_KEY,
+  AIR_LOAD_REPLAY_END_CAPABILITY,
+  AIR_LOAD_REPLAY_END_KEY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   AIR_SKILL_PATH_KEY,
   clientSupportsAirCapability,
@@ -185,9 +189,15 @@ import {
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
 import {
+  clientSystemPrompt,
+  sdkSystemPrompt,
+  SYSTEM_PROMPT_CAPABILITY,
+} from "./client-system-prompt.js";
+import {
   readSubagentMessages,
   subagentHistory,
   subagentLaunchIds,
+  subagentLaunchedBy,
   subagentLineage,
 } from "./subagent-history.js";
 import {
@@ -241,6 +251,7 @@ import {
   type FileChangeReportTurnState,
   type FileChangeReportUnavailableReason,
   type NativeFileChangeReporter,
+  recordSubagentFileEdits,
   supportsAgentFileChangeReport,
 } from "./file-change-audit.js";
 import {
@@ -288,7 +299,7 @@ import {
   type ToolCallUpdate,
   type ToolUpdateMeta,
 } from "./tool-calls/renderer.js";
-import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
+import { resolveSkillPath, type SkillScanCache } from "./tool-calls/reporters/interaction.js";
 import {
   messageLoopYielder,
   nodeToWebReadable,
@@ -307,6 +318,12 @@ import {
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
+import {
+  markerTagText,
+  type PersistedTaskNotification,
+  TASK_NOTIFICATION_TAG,
+  taskNotificationsOf,
+} from "./task-notifications.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
@@ -551,6 +568,66 @@ function supportsMcpOAuth(query: Query): query is McpOAuthQuery {
   return typeof (query as Partial<McpOAuthQuery>).mcpAuthenticate === "function";
 }
 
+/** Runtime Remote Control control exposed by the pinned Agent SDK. Like
+ *  `mcpAuthenticate`, it is not in the public `Query` declaration yet. The CLI's
+ *  own `/remote-control` is terminal-bound and not offered to SDK hosts, so the
+ *  adapter handles the command itself and answers with the session URL. */
+type RemoteControlQuery = Query & {
+  enableRemoteControl(
+    enabled: boolean,
+    name?: string,
+  ): Promise<{ session_url?: string; connect_url?: string }>;
+};
+
+function supportsRemoteControl(query: Query): query is RemoteControlQuery {
+  return typeof (query as Partial<RemoteControlQuery>).enableRemoteControl === "function";
+}
+
+const REMOTE_CONTROL_COMMAND_NAME = "remote-control";
+
+type RemoteControlCommand = { action: "connect"; name?: string } | { action: "disconnect" };
+
+/** Parses `/remote-control [name]` and `/remote-control off` from a single-text
+ *  prompt. Connecting is idempotent, so the command never needs to know whether
+ *  Remote Control is already on. */
+function parseRemoteControlCommand(prompt: PromptRequest["prompt"]): RemoteControlCommand | null {
+  const [first] = prompt;
+  if (prompt.length !== 1 || first?.type !== "text") return null;
+  const match = /^\/remote-control(?:\s+([\s\S]*))?$/.exec(first.text.trim());
+  if (!match) return null;
+  const argument = match[1]?.trim();
+  if (argument?.toLowerCase() === "off") return { action: "disconnect" };
+  return argument ? { action: "connect", name: argument } : { action: "connect" };
+}
+
+/** A top-level message a person typed in another client of the session, such
+ *  as claude.ai or the Claude mobile app over Remote Control. Tool results and
+ *  the CLI's own synthetic messages are user-role too, but carry no human
+ *  origin. */
+function isRemoteHumanMessage(message: SDKUserMessage | SDKUserMessageReplay): boolean {
+  return (
+    message.type === "user" &&
+    message.origin?.kind === "human" &&
+    message.parent_tool_use_id === null &&
+    !message.isSynthetic
+  );
+}
+
+/** Whether Claude Code offers a slash command of this name to an ACP client.
+ *  This is the rule `getAvailableSlashCommands` applies when it lists the
+ *  commands, so the adapter stands in for the command exactly when the client
+ *  sees the adapter's entry: Claude Code's terminal-bound commands are not
+ *  offered, and a user's own command or skill of the name is never shadowed. */
+function claudeCodeOffersCommand(
+  commands: readonly SlashCommand[],
+  terminalCommands: readonly string[] | undefined,
+  name: string,
+): boolean {
+  return commands.some(
+    (command) => command.name === name && !terminalCommands?.includes(command.name),
+  );
+}
+
 /** Wait for a polling interval, resolving false when the session is aborted. */
 function waitUnlessAborted(milliseconds: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
@@ -734,6 +811,9 @@ type Turn = {
    *  turn. The state is turn-owned so a late control response can never be
    *  rebound to a newer prompt. */
   fileChangeReport?: FileChangeReportTurnState;
+  /** Files that subagents of this turn edited with a file tool, collected only
+   *  when a report was requested (see {@link recordSubagentFileEdits}). */
+  editedPaths?: Set<string>;
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
   settled: boolean;
@@ -941,6 +1021,15 @@ export type Session = {
   /** Last goal snapshot sent to the ACP client, used to roll back an
    *  optimistic `/goal` update when the command itself fails. */
   lastPublishedGoal?: GoalSnapshot | null;
+  /** Last follow-up prompt sent to the ACP client (`null` after a clear), so an
+   *  unchanged prediction is not re-notified. Undefined until the first push. */
+  lastPublishedPromptSuggestion?: string | null;
+  /** Whether an arriving `prompt_suggestion` still answers the turn the user is
+   *  waiting on: set at a turn's result, cleared when the next prompt arrives.
+   *  A prediction the user outran — the next prompt was sent before the
+   *  prediction was read off the stream — follows a turn that is already
+   *  answered, so it is dropped instead of published mid-turn. */
+  promptSuggestionExpected?: boolean;
   /** Count of result messages the consumer should treat as orphans and skip
    *  (not promote/attribute to the current head). When cancel() settles+removes
    *  a queued turn, that turn's user message was already pushed to the SDK, so
@@ -1005,6 +1094,13 @@ export type Session = {
    *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
    *  these are filtered out of `available_commands_update` payloads. */
   terminalSlashCommands?: string[];
+  /** The uuids of the user messages this adapter pushed whose echo has not come
+   *  back yet. Claude Code stamps the echo with the same human origin as a
+   *  message typed in another client, so the uuid is what tells the two apart. */
+  sentUserUuids?: Set<string>;
+  /** The `/remote-control` command that is running, from its request to its
+   *  reply. Prompts wait for it, and a second command is refused meanwhile. */
+  remoteControlCommand?: Promise<void>;
   /** The resolved SKILL.md paths of the skill commands, keyed by the cwd and
    *  the command name. A `commands_changed` clears it, because the skill
    *  files can have changed then. */
@@ -1022,6 +1118,9 @@ export type Session = {
    *  hanging (or silently restarting a consumer that resolves `end_turn`
    *  without ever reaching the model). */
   queryClosed?: boolean;
+  /** Set when `teardownSession` starts (a `session/close` or the connection
+   *  closing), so a prompt that was still starting ends cancelled. */
+  tornDown?: boolean;
   cwd: string;
   /** Serialized snapshot of session-defining params (cwd, mcpServers, skills)
    *  used to detect when loadSession/resumeSession is called with changed values. */
@@ -1630,6 +1729,7 @@ export function computeSessionFingerprint(params: {
   cwd: string;
   mcpServers?: NewSessionRequest["mcpServers"];
   additionalDirectories?: NewSessionRequest["additionalDirectories"];
+  systemPrompt?: NewSessionRequest["systemPrompt"];
   _meta?: NewSessionRequest["_meta"];
 }): string {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
@@ -1647,6 +1747,7 @@ export function computeSessionFingerprint(params: {
       additionalDirectories: params.additionalDirectories,
       additionalRoots: meta?.additionalRoots,
       systemPrompt: meta?.systemPrompt,
+      clientSystemPrompt: params.systemPrompt ?? undefined,
       disableBuiltInTools: meta?.disableBuiltInTools,
       emitRawSDKMessages: meta?.claudeCode?.emitRawSDKMessages,
       options,
@@ -2049,7 +2150,6 @@ const LOCAL_COMMAND_MARKERS = [
 // model that a background task stopped; live, the SDK `task_notification`
 // frame reports the same stop, so replay restores the task state from it (see
 // taskNotificationsOf) instead of showing it.
-const TASK_NOTIFICATION_TAG = "task-notification";
 const INJECTED_CONTEXT_MARKERS = ["system-reminder", TASK_NOTIFICATION_TAG].map((tag) => ({
   open: `<${tag}>`,
   close: `</${tag}>`,
@@ -2086,16 +2186,6 @@ function stripMarkerTags(text: string): string {
     i++;
   }
   return result + text.slice(copiedUpTo);
-}
-
-function markerTagText(text: string, tag: string): string | undefined {
-  const open = `<${tag}>`;
-  const close = `</${tag}>`;
-  const start = text.indexOf(open);
-  if (start === -1) return undefined;
-  const end = text.indexOf(close, start + open.length);
-  if (end === -1) return undefined;
-  return text.slice(start + open.length, end);
 }
 
 function hasMarkerTag(text: string, tag: string): boolean {
@@ -2156,57 +2246,6 @@ export function stripLocalCommandMetadata(content: unknown): unknown | null {
 
 export function isLocalCommandMetadata(content: unknown): boolean {
   return stripLocalCommandMetadata(content) === null;
-}
-
-/** The fields of a persisted `<task-notification>`, in the shape of the SDK
- *  `task_notification` frame that reported the same stop live. */
-type PersistedTaskNotification = {
-  task_id: string;
-  status: string;
-  tool_use_id?: string;
-  summary?: string;
-  output_file?: string;
-};
-
-/**
- * Returns each `<task-notification>` in user-message content (a string or its
- * text blocks). The `<result>` body is model context that the live frame does
- * not carry, so the scan stops at it and a tag quoted in it cannot match.
- */
-function taskNotificationsOf(content: unknown): PersistedTaskNotification[] {
-  const texts =
-    typeof content === "string"
-      ? [content]
-      : Array.isArray(content)
-        ? content.flatMap((block) =>
-            block?.type === "text" && typeof block.text === "string" ? [block.text as string] : [],
-          )
-        : [];
-  const open = `<${TASK_NOTIFICATION_TAG}>`;
-  const close = `</${TASK_NOTIFICATION_TAG}>`;
-  const notifications: PersistedTaskNotification[] = [];
-  for (const text of texts) {
-    let start = text.indexOf(open);
-    while (start !== -1) {
-      const end = text.indexOf(close, start + open.length);
-      if (end === -1) break;
-      const body = text.slice(start + open.length, end).split("<result>", 1)[0];
-      const field = (tag: string) => markerTagText(body, tag)?.trim() || undefined;
-      const taskId = field("task-id");
-      const status = field("status");
-      if (taskId && status) {
-        notifications.push({
-          task_id: taskId,
-          status,
-          tool_use_id: field("tool-use-id"),
-          summary: field("summary"),
-          output_file: field("output-file"),
-        });
-      }
-      start = text.indexOf(open, end + close.length);
-    }
-  }
-  return notifications;
 }
 
 /**
@@ -2882,6 +2921,7 @@ export class ClaudeAcpAgent {
       fork: {},
       list: {},
       resume: {},
+      systemPrompt: SYSTEM_PROMPT_CAPABILITY,
       ...(this.toolCallCapabilities.air.client ? { subagents: {} } : {}),
     };
 
@@ -2979,6 +3019,7 @@ export class ClaudeAcpAgent {
     timing: SessionTiming,
   ): Promise<NewSessionResponse> {
     await this.validateCwd(params.cwd);
+    clientSystemPrompt(params.systemPrompt);
     const pending: PendingReplay = {
       state: {
         cwd: params.cwd,
@@ -3003,6 +3044,7 @@ export class ClaudeAcpAgent {
           cwd: params.cwd,
           mcpServers: params.mcpServers ?? [],
           additionalDirectories: params.additionalDirectories,
+          systemPrompt: params.systemPrompt,
           _meta: params._meta,
         },
         {
@@ -3035,20 +3077,33 @@ export class ClaudeAcpAgent {
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     while (this.providerUpdate) await this.providerUpdate;
+    // Reject a prompt the agent cannot apply before copying the transcript.
+    clientSystemPrompt(params.systemPrompt);
     const { sessionId } = await forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
       logger: this.logger,
       messageIdForGrouping,
     });
+    // The fork row can lack `forkedFrom`: the scan reads it from the first
+    // 64 KB of the transcript only. So the fork is held back by its id too.
+    this.sessionIndex.onForkCreated(params.sessionId, sessionId);
     const { modes, configOptions } = await this.getOrCreateSession({
       sessionId,
       cwd: params.cwd,
       mcpServers: params.mcpServers,
       additionalDirectories: params.additionalDirectories,
+      systemPrompt: params.systemPrompt,
       _meta: params._meta,
     });
     this.afterSetupResponse(sessionId, params.mcpServers ?? []);
     return { sessionId, modes, configOptions };
+  }
+
+  /** Runs `fork`, the handler of a `session/fork` request of `sourceId`,
+   *  with its forks held back from the session list (see
+   *  {@link sessionIndex.SessionIndexConnection.forking}). */
+  forking<T>(sourceId: string, fork: () => Promise<T>): Promise<T> {
+    return this.sessionIndex.forking(sourceId, fork);
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -3716,6 +3771,62 @@ export class ClaudeAcpAgent {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
+    const remoteControlCommand = parseRemoteControlCommand(params.prompt);
+    if (
+      remoteControlCommand &&
+      supportsRemoteControl(session.query) &&
+      !claudeCodeOffersCommand(
+        await session.query.supportedCommands(),
+        session.terminalSlashCommands,
+        REMOTE_CONTROL_COMMAND_NAME,
+      )
+    ) {
+      // The reply bypasses the turn queue, so it would land inside the output of
+      // a turn that is still running, and v2 would report no `running` state
+      // around it. Refuse instead of interleaving. `foregroundWork` also covers
+      // a cycle that Claude Code started on its own, such as its follow-up
+      // after a background subagent finished, which is not in `turnQueue`.
+      if (
+        this.foregroundWork.has(params.sessionId) ||
+        (session.turnQueue ?? []).some((turn) => !turn.settled)
+      ) {
+        throw RequestError.invalidRequest(
+          undefined,
+          "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
+        );
+      }
+      if (session.remoteControlCommand) {
+        throw RequestError.invalidRequest(
+          undefined,
+          "Remote Control is already being changed. Try again in a moment.",
+        );
+      }
+      // Once Remote Control is on, other clients can start turns or send
+      // messages on their own. Something has to read the query stream for
+      // those to reach this client, and a command that answers without a turn
+      // would otherwise leave the stream unread until the next prompt.
+      this.ensureConsumer(session, params.sessionId);
+      // Answered by the adapter without a model turn; v2 clients treat an
+      // `ended` without a prior `inserted` as a refused prompt.
+      events.inserted(randomUUID());
+      // The request goes over the network. Until it and its reply are done,
+      // `remoteControlCommand` holds back the prompts that follow, which would
+      // otherwise start a turn that the reply lands in.
+      const command = this.runRemoteControlCommand(
+        params.sessionId,
+        session.query,
+        remoteControlCommand,
+      );
+      session.remoteControlCommand = command;
+      try {
+        await command;
+      } finally {
+        session.remoteControlCommand = undefined;
+      }
+      events.ended({ stopReason: "end_turn" });
+      return;
+    }
+
     const subscriptionGuard = this.runClaudeSubscriptionGuard(params.sessionId, session);
     if (subscriptionGuard) await subscriptionGuard;
 
@@ -3743,6 +3854,37 @@ export class ClaudeAcpAgent {
     const localCommandAbort = localCommand ? new AbortController() : undefined;
 
     session.titles.onPrompt(params.prompt);
+
+    // The prompt the previous turn predicted is spent: the user either sent it
+    // or sent something else. Clearing it here keeps a turn that predicts
+    // nothing (the CLI predicts none in plan mode, after an API error, or at
+    // the usage limit) from leaving the stale prediction in the composer. A
+    // session that holds no prediction needs no clear, and the prompt path
+    // then keeps the ordering it has without this feature.
+    if (session.lastPublishedPromptSuggestion != null) {
+      await this.publishPromptSuggestion(params.sessionId, null);
+    } else {
+      session.promptSuggestionExpected = false;
+    }
+
+    // A `/remote-control` command still in flight answers into the session's
+    // output; wait for its reply before this prompt's turn can begin. Nothing
+    // below awaits before the turn is queued, so no command can start between.
+    // A failure of the command's reply is reported to the command's own prompt.
+    if (session.remoteControlCommand) await session.remoteControlCommand.catch(() => {});
+
+    // A `session/close` during the awaits above tore the session down, and
+    // its consumer is gone, so the prompt would never be inserted. End it as
+    // the close ends a queued turn: `cancelled` on v1, -32800 on v2. A stream
+    // that ended meanwhile fails the prompt as the check above does.
+    if (session.tornDown) {
+      session.fileChangeReporter?.finish(fileChangeReport, "cancelled");
+      events.ended({ stopReason: "cancelled" });
+      return;
+    }
+    if (this.sessions[params.sessionId] !== session || session.queryClosed) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
 
     // Each prompt is a Turn that the persistent consumer settles once the
     // turn's outcome is known. `startTurn()` owns no loop: it enqueues the
@@ -3774,6 +3916,7 @@ export class ClaudeAcpAgent {
 
     session.turnQueue ??= [];
     session.turnQueue.push(turn);
+    (session.sentUserUuids ??= new Set()).add(promptUuid);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
     // The prompt is queued, so its turn goes ahead even if the client misses
@@ -3781,6 +3924,38 @@ export class ClaudeAcpAgent {
     await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid).catch((error) =>
       this.logger.error(`Session ${params.sessionId}: failed to publish the prompt's goal:`, error),
     );
+  }
+
+  /** Connects Remote Control (again, if it is already on) or disconnects it. */
+  private async runRemoteControlCommand(
+    sessionId: string,
+    query: RemoteControlQuery,
+    command: RemoteControlCommand,
+  ): Promise<void> {
+    let text: string;
+    if (command.action === "disconnect") {
+      try {
+        await query.enableRemoteControl(false);
+        text = "Remote Control is off. Run /remote-control to reconnect.";
+      } catch (error) {
+        this.logger.error(`Failed to disable Remote Control: ${error}`);
+        text = `Could not stop Remote Control: ${error instanceof Error ? error.message : error}`;
+      }
+    } else {
+      try {
+        const result = await query.enableRemoteControl(true, command.name);
+        text = result.session_url
+          ? `Remote Control is active. Continue this session from claude.ai/code or the Claude mobile app:\n\n${result.session_url}\n\nRun /remote-control off to disconnect.`
+          : "Remote Control is active, but Claude Code did not return a session URL.";
+      } catch (error) {
+        this.logger.error(`Failed to enable Remote Control: ${error}`);
+        text = `Could not start Remote Control: ${error instanceof Error ? error.message : error}`;
+      }
+    }
+    await this.client.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+    });
   }
 
   /** `--hide-claude-auth` applies only to the CLI's own login. A provider
@@ -4008,6 +4183,31 @@ export class ClaudeAcpAgent {
     });
   }
 
+  /**
+   * Publishes the follow-up prompt the CLI predicted for the next turn, or
+   * `null` to clear the one the client holds. Only AIR renders it, so only AIR
+   * gets the key; see `docs/air-extensions.md`.
+   */
+  private async publishPromptSuggestion(sessionId: string, text: string | null): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    // A clear ends the window the turn's result opened: whatever prediction is
+    // still in flight answers a turn the user has already moved past.
+    if (text === null) session.promptSuggestionExpected = false;
+    // A session that never published one holds nothing, so a clear before the
+    // first prediction is already true on the client and goes nowhere.
+    if ((session.lastPublishedPromptSuggestion ?? null) === text) return;
+    if (!this.toolCallCapabilities.air.client) return;
+    session.lastPublishedPromptSuggestion = text;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: promptSuggestionsMeta(text),
+      },
+    });
+  }
+
   private async publishTaskPlan(sessionId: string, taskState: TaskState): Promise<void> {
     const entries = changedTaskPlanEntries(taskState, this.toolCallCapabilities.air.client);
     if (!entries) return;
@@ -4161,6 +4361,7 @@ export class ClaudeAcpAgent {
     } else {
       session.autonomousSteering!.add(steeredUuid);
     }
+    (session.sentUserUuids ??= new Set()).add(steeredUuid);
     session.input.push(userMessage);
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
@@ -4173,7 +4374,25 @@ export class ClaudeAcpAgent {
     if (!session || !asyncTasks?.claimStop(params.asyncTaskId)) return { stopped: false };
 
     try {
-      await session.query.stopTask(params.asyncTaskId);
+      if (asyncTasks.isAutonomousTurn(params.asyncTaskId)) {
+        // The task stands for a turn that Claude Code started on its own, so
+        // stopping it interrupts that turn. A prompt that waits for its turn
+        // would be folded into it, and the interrupt would drop that prompt.
+        if ((session.turnQueue ?? []).some((turn) => !turn.settled)) {
+          asyncTasks.releaseStop(params.asyncTaskId);
+          return { stopped: false };
+        }
+        // Stop accepting steers before the interrupt can yield a result.
+        // Its outstanding commands belong to the stopped cycle, not a later prompt.
+        session.cancelled = true;
+        session.cancelledPrompts ??= new Set();
+        for (const uuid of session.autonomousSteering?.cancel() ?? []) {
+          session.cancelledPrompts.add(uuid);
+        }
+        await session.query.interrupt();
+      } else {
+        await session.query.stopTask(params.asyncTaskId);
+      }
       await asyncTasks.taskStopped(params.asyncTaskId);
       return { stopped: true };
     } catch (error) {
@@ -4290,6 +4509,7 @@ export class ClaudeAcpAgent {
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       this.logger,
       (agentId) => subagentLineage(params.sessionId, agentId, this.logger),
+      (launchId) => subagentLaunchedBy(params.sessionId, launchId),
     ));
     // Adapter-composed advisories (hook feedback, model fallbacks) are live
     // events, not something the model said. Clients on the notice contract get
@@ -4768,6 +4988,7 @@ export class ClaudeAcpAgent {
       if (!head) {
         return;
       }
+      if (asyncTasks.autonomousTurnOpen) await asyncTasks.autonomousTurnEnded("completed");
       activateTurn(head);
     };
 
@@ -5380,12 +5601,18 @@ export class ClaudeAcpAgent {
       );
     };
 
-    /** Reject every in-flight turn — used when the stream dies. */
+    /** Reject every in-flight turn — used when the stream dies. After a
+     *  cancel, the active turn and an autonomous cycle end "cancelled"
+     *  instead: the abort the cancel started can kill the stream, and that
+     *  error is the cancel's, not the work's. */
     const failAllTurns = (error: unknown) => {
       disarmForceCancel(session);
-      endConsumerAutonomousCycle({ error });
-      const turns = session.activeTurn
-        ? [session.activeTurn, ...(session.turnQueue ?? []).filter((t) => t !== session.activeTurn)]
+      endConsumerAutonomousCycle(
+        session.cancelled ? { outcome: { stopReason: "cancelled" } } : { error },
+      );
+      const active = session.activeTurn;
+      const turns = active
+        ? [active, ...(session.turnQueue ?? []).filter((t) => t !== active)]
         : [...(session.turnQueue ?? [])];
       session.activeTurn = null;
       session.turnQueue = [];
@@ -5400,7 +5627,11 @@ export class ClaudeAcpAgent {
             // background failure, not the turn's. Resolve with the real
             // outcome, mirroring the stream-done path.
             turn.resolve(turn.deferredSettle);
+          } else if (session.cancelled && turn === active) {
+            turn.resolve(cancelledOutcome(session, turn));
           } else {
+            // A queued turn never ran. One queued at the cancel was settled
+            // by it, so this one came later and was not part of the cancel.
             turn.reject(error);
           }
         }
@@ -5723,6 +5954,21 @@ export class ClaudeAcpAgent {
           this.startAutonomousCycle(params.sessionId, session, message);
         }
 
+        // From CLI 2.1.270 the state stays `running` while background agents
+        // run, so a turn that their notification starts has no `running`
+        // transition. Its first output with no prompt open starts its task.
+        if (
+          asyncTasks.enabled &&
+          !asyncTasks.autonomousTurnOpen &&
+          (message.type === "assistant" || message.type === "stream_event") &&
+          message.parent_tool_use_id === null &&
+          !session.cancelled &&
+          !session.activeTurn &&
+          !firstUnsettledQueuedTurn()
+        ) {
+          await asyncTasks.autonomousTurnStarted();
+        }
+
         switch (message.type) {
           case "system":
             switch (message.subtype) {
@@ -5879,6 +6125,20 @@ export class ClaudeAcpAgent {
                 sessionIndex.noteSessionState(session, previousState, message.state);
                 if (message.state === "running") this.sessionIndex.onTurnStarted(params.sessionId);
                 this.sessionIndex.onOwnSessionChanged(params.sessionId);
+                // With no prompt active or queued, the agent runs a turn of
+                // its own, for example for a task notification. The client
+                // sees it as an async task (see autonomousTurnStarted).
+                if (
+                  asyncTasks.enabled &&
+                  message.state === "running" &&
+                  previousState !== "running" &&
+                  !session.activeTurn &&
+                  !firstUnsettledQueuedTurn()
+                ) {
+                  await asyncTasks.autonomousTurnStarted();
+                } else if (message.state === "idle" && asyncTasks.autonomousTurnOpen) {
+                  await asyncTasks.autonomousTurnEnded("completed");
+                }
                 if (
                   message.state === "running" &&
                   previousState !== "running" &&
@@ -6068,6 +6328,7 @@ export class ClaudeAcpAgent {
                       session.terminalSlashCommands,
                       this.toolCallCapabilities.air.client ? session.cwd : undefined,
                       session.skillPaths,
+                      session.query,
                     ),
                   },
                 });
@@ -6571,6 +6832,9 @@ export class ClaudeAcpAgent {
           case "result": {
             const answeredAutonomousSteers = session.autonomousSteering?.result(message);
             session.modelRequestSinceResult = false;
+            // The CLI predicts the next prompt right after this result, so a
+            // `prompt_suggestion` from here on belongs to the turn just ended.
+            session.promptSuggestionExpected = true;
             // The result ends the model turn. A background task that still
             // waits for its tool call id gets its spawn now, without the id.
             await asyncTasks.releaseHeld();
@@ -6587,6 +6851,15 @@ export class ClaudeAcpAgent {
             const isAutonomousResult =
               (startedByClaudeCode || (answeredAutonomousSteers?.size ?? 0) > 0) &&
               !answersPendingPrompt(message);
+            // A placeholder result (`num_turns: 0`, see below) comes before
+            // the followup that answers it, so the autonomous turn goes on.
+            if (
+              isAutonomousResult &&
+              asyncTasks.autonomousTurnOpen &&
+              (message.num_turns > 0 || message.is_error)
+            ) {
+              await asyncTasks.autonomousTurnEnded(message.is_error ? "failed" : "completed");
+            }
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
@@ -7574,6 +7847,9 @@ export class ClaudeAcpAgent {
               if (session.pendingGoalUpdate?.commandUuid === message.uuid) {
                 session.pendingGoalUpdate.started = true;
               }
+              // Taken out for every echo, not only in the branch below, so the
+              // set does not grow with each prompt.
+              const sentByAdapter = session.sentUserUuids?.delete(message.uuid) ?? false;
               const queued = findUnsettledTurn(message.uuid);
               if (queued) {
                 // Only (re)activate if this isn't already the active turn — a
@@ -7639,6 +7915,10 @@ export class ClaudeAcpAgent {
                   // mid-message, so deltas already streamed belong to the turn
                   // being activated — clearing would forget them and let its
                   // result re-emit the answer.
+                  // A prompt folded into an autonomous turn owns that turn now.
+                  if (asyncTasks.autonomousTurnOpen) {
+                    await asyncTasks.autonomousTurnEnded("completed");
+                  }
                   activateTurn(queued);
                 }
                 break;
@@ -7656,7 +7936,34 @@ export class ClaudeAcpAgent {
                 ) {
                   session.activeTurn.steeredAwaitingResult = true;
                 }
-                // Unrelated replay (e.g. the echo of an already-settled turn).
+                // A message typed in another client of the session (Remote
+                // Control from claude.ai or the mobile app). The adapter's own
+                // prompts and steers are stamped human too, so they are told
+                // apart by uuid: a steer matches no turn, and a turn can settle
+                // before its echo comes.
+                const remoteContent =
+                  !sentByAdapter && isRemoteHumanMessage(message)
+                    ? stripLocalCommandMetadata(message.message.content)
+                    : null;
+                if (remoteContent !== null) {
+                  for (const notification of toAcpNotifications(
+                    remoteContent as ContentBlockParam[] | string,
+                    "user",
+                    params.sessionId,
+                    session.toolUseCache,
+                    routedNotificationClient,
+                    this.logger,
+                    {
+                      clientCapabilities: this.clientCapabilities,
+                      toolCallCapabilities: this.toolCallCapabilities,
+                      cwd: session.cwd,
+                      messageId: messageIdForGrouping(message),
+                    },
+                  )) {
+                    await sendUpdate(notification);
+                  }
+                }
+                // Otherwise an unrelated replay (e.g. the echo of an already-settled turn).
                 break;
               }
             }
@@ -7864,6 +8171,12 @@ export class ClaudeAcpAgent {
             let runningTerminal: string | undefined;
             if (message.type === "user") {
               rememberResolvedToolNames(session, content);
+              recordSubagentFileEdits(
+                session.activeTurn,
+                message.parent_tool_use_id,
+                content,
+                session.toolUseCache,
+              );
               const backgroundBashTask = backgroundBashTaskFromToolResult(
                 content,
                 message.tool_use_result,
@@ -8046,11 +8359,25 @@ export class ClaudeAcpAgent {
             // cached title no longer describes the session: drop it and
             // re-evaluate at the next turn-end.
             session.titles.reset();
+            // The follow-up prompt was predicted from the transcript the reset
+            // dropped, so it no longer follows from anything.
+            await this.publishPromptSuggestion(params.sessionId, null);
             break;
           }
           case "tool_use_summary":
-          case "prompt_suggestion":
             break;
+          case "prompt_suggestion": {
+            // The CLI predicts the next prompt after the turn's `result`. AIR
+            // shows it as gray text in an empty composer; Tab fills the
+            // composer, and nothing is sent until the user sends it.
+            if (!session.promptSuggestionExpected) break;
+            session.promptSuggestionExpected = false;
+            await this.publishPromptSuggestion(
+              params.sessionId,
+              promptSuggestionText(message.suggestion),
+            );
+            break;
+          }
           case "auth_status":
             if (!message.isAuthenticating && message.error === undefined) {
               await sessionFailures.clear((failure) => failure.kind === "auth_required");
@@ -8085,6 +8412,18 @@ export class ClaudeAcpAgent {
         session.cancelled ? "stopped" : "failed",
         "after stream error",
       );
+      if (session.cancelled) {
+        // End the cancelled turn as a cancel does, closing its open tool calls
+        // first; failAllTurns below settles it if this could not.
+        try {
+          await settleActive(cancelledOutcome(session, session.activeTurn));
+        } catch (settleError) {
+          this.logger.error(
+            `Session ${params.sessionId}: failed to settle the cancelled turn after a stream error`,
+            settleError,
+          );
+        }
+      }
       if (supportsAirSessionFailures(this.clientCapabilities) && session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           await failActiveWithSessionFailure(
@@ -8666,8 +9005,10 @@ export class ClaudeAcpAgent {
     if (!session) {
       return;
     }
+    session.tornDown = true;
+    const turns = [...(session.turnQueue ?? [])];
     const turnsEnded = Promise.all(
-      (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),
+      turns.flatMap((turn) => (turn.completion ? [turn.completion] : [])),
     );
     try {
       await this.cancelTurns({ sessionId }, { awaitInterrupt: false });
@@ -8708,6 +9049,23 @@ export class ClaudeAcpAgent {
       this.logger.error(
         `Session ${sessionId}: its cancelled turns did not end within ${TEARDOWN_TURN_END_TIMEOUT_MS}ms of the teardown`,
       );
+      // Settle them here, so the close still answers after each turn's end: a
+      // v1 prompt gets `cancelled`, a v2 prompt not yet inserted gets -32800,
+      // and an inserted one ends in an `idle` with `cancelled`.
+      for (const turn of turns) {
+        if (turn.settled) continue;
+        session.fileChangeReporter?.finish(turn.fileChangeReport, "cancelled");
+        turn.settled = true;
+        turn.resolve(cancelledOutcome(session, turn));
+      }
+      session.turnQueue = [];
+      session.activeTurn = null;
+      // Foreground work that no turn owns, such as a cycle that Claude Code
+      // started after the endAutonomousCycle call above.
+      const work = this.foregroundWork.get(sessionId);
+      if (work) {
+        this.endForeground(sessionId, work.owner, { outcome: { stopReason: "cancelled" } });
+      }
     }
   }
 
@@ -9324,6 +9682,22 @@ export class ClaudeAcpAgent {
     this.logger.log(
       `[session/replay] sessionId=${sessionId} phase=publish durationMs=${Math.round(replayFinishedAt - historyLoadedAt)} totalMs=${Math.round(replayFinishedAt - replayStartedAt)} messages=${messages.length}`,
     );
+    // A client with `loadReplayEnd` gets one more update after the whole
+    // replay, the subagent history included. A stopped replay (the CLI start
+    // failed) does not get it, and a failed replay throws before this line.
+    if (
+      !pending?.stopped &&
+      clientSupportsAirCapability(this.clientCapabilities, AIR_LOAD_REPLAY_END_CAPABILITY)
+    ) {
+      await this.client.sessionUpdate({
+        sessionId,
+        // No `title` and no `updatedAt`: `null` would clear them.
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: withAirMeta(undefined, AIR_LOAD_REPLAY_END_KEY, true),
+        },
+      });
+    }
   }
 
   async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
@@ -9409,6 +9783,16 @@ export class ClaudeAcpAgent {
     work.awaitingUser = waiting;
     if (waiting) work.events.awaitingUser();
     else if (!withdrawnByCancel) work.events.running();
+  }
+
+  /** The foreground state of the session `sessionId` now, as v2's
+   *  `state_update` names it: `idle` while no work runs, `requires_action`
+   *  while the work awaits the user (see {@link syncAwaitingUser}), and
+   *  `running` otherwise. */
+  foregroundState(sessionId: string): "idle" | "running" | "requires_action" {
+    const work = this.foregroundWork.get(sessionId);
+    if (!work) return "idle";
+    return work.awaitingUser ? "requires_action" : "running";
   }
 
   /** Make `owner` the foreground work of the session `sessionId` (see
@@ -10183,6 +10567,7 @@ export class ClaudeAcpAgent {
       session.terminalSlashCommands,
       this.toolCallCapabilities.air.client ? session.cwd : undefined,
       (session.skillPaths ??= new Map()),
+      session.query,
     );
   }
 
@@ -10633,10 +11018,13 @@ export class ClaudeAcpAgent {
       cwd: string;
       mcpServers?: NewSessionRequest["mcpServers"];
       additionalDirectories?: NewSessionRequest["additionalDirectories"];
+      systemPrompt?: NewSessionRequest["systemPrompt"];
       _meta?: NewSessionRequest["_meta"];
     },
     resumedSession?: ResumedSessionSnapshot,
   ): Promise<NewSessionResponse> {
+    // Reject a prompt the agent cannot apply before reusing a live session.
+    clientSystemPrompt(params.systemPrompt);
     const existingSession = this.sessions[params.sessionId];
     // A recreated live session keeps its mode, not the mode of the transcript.
     const livePermissionMode = existingSession?.modes.currentModeId as PermissionMode | undefined;
@@ -10661,6 +11049,7 @@ export class ClaudeAcpAgent {
       cwd: params.cwd,
       mcpServers: params.mcpServers ?? [],
       additionalDirectories: params.additionalDirectories,
+      systemPrompt: params.systemPrompt,
       _meta: params._meta,
     };
     const creation = {
@@ -10746,6 +11135,7 @@ export class ClaudeAcpAgent {
     // failure only surfaces later as a confusing "native binary failed to
     // launch" error from the SDK (see issue #749).
     await this.validateCwd(params.cwd);
+    const clientPrompt = clientSystemPrompt(params.systemPrompt);
 
     // We want to create a new session id unless it is resume,
     // but not resume + forkSession.
@@ -10841,6 +11231,9 @@ export class ClaudeAcpAgent {
         } as Options["systemPrompt"];
       }
     }
+    // The spec's `systemPrompt` takes precedence over the `_meta.systemPrompt`
+    // extension above.
+    if (clientPrompt) systemPrompt = sdkSystemPrompt(clientPrompt, customInstructions);
 
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
@@ -10989,6 +11382,13 @@ export class ClaudeAcpAgent {
       // interrupt either way. Before `userProvidedOptions`, so a client's own
       // `perTaskStopAffordance` wins.
       ...(subagentForm(this.clientCapabilities) === "rfd" ? { perTaskStopAffordance: true } : {}),
+      // One predicted follow-up prompt per turn, published as
+      // `session_info_update._meta.promptSuggestions`. It rides the turn's own
+      // prompt cache, and the user can turn it off in settings.json
+      // (`promptSuggestionEnabled`) or with CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false.
+      // Before `userProvidedOptions`, so a client that passes
+      // `promptSuggestions: false` keeps it off.
+      promptSuggestions: true,
       ...userProvidedOptions,
       // Claude Code uses the same checkpoint store for /rewind. Enable it only
       // for clients that negotiated per-turn file-change reports; this avoids
@@ -12324,11 +12724,14 @@ function getAvailableSlashCommands(
   airSkillCwd?: string,
   // The resolved SKILL.md paths of the session, keyed by the cwd and the name.
   skillPaths?: Map<string, string | undefined>,
+  query?: Query,
 ): AvailableCommand[] {
+  // The container listings of this one pass, so a list of a hundred commands lists each container once.
+  const skillScans: SkillScanCache = new Map();
   const skillPath = (name: string, cwd: string): string | undefined => {
     const key = `${cwd}\0${name}`;
     if (skillPaths?.has(key)) return skillPaths.get(key);
-    const resolved = resolveSkillPath(name, cwd);
+    const resolved = resolveSkillPath(name, cwd, skillScans);
     skillPaths?.set(key, resolved);
     return resolved;
   };
@@ -12343,6 +12746,18 @@ function getAvailableSlashCommands(
     "release-notes",
     "todos",
   ];
+
+  const remoteControlCommands: AvailableCommand[] =
+    query && supportsRemoteControl(query)
+      ? [
+          {
+            name: REMOTE_CONTROL_COMMAND_NAME,
+            description:
+              "Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects",
+            input: { hint: "[session name | off]" },
+          },
+        ]
+      : [];
 
   // The adapter replaces the terminal text of `/mcp` and runs its actions,
   // even when Claude Code tags the command terminal-bound.
@@ -12381,7 +12796,14 @@ function getAvailableSlashCommands(
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
-  return [...advertised, MCP_AVAILABLE_COMMAND];
+
+  return [
+    ...advertised,
+    MCP_AVAILABLE_COMMAND,
+    ...remoteControlCommands.filter(
+      (command) => !claudeCodeOffersCommand(commands, terminalCommands, command.name),
+    ),
+  ];
 }
 
 function formatUriAsLink(uri: string): string {
@@ -13305,7 +13727,9 @@ export function v1AgentApp(
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
     .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
     .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))
-    .onRequest(methods.agent.session.fork, (ctx) => agent.unstable_forkSession(ctx.params))
+    .onRequest(methods.agent.session.fork, (ctx) =>
+      agent.forking(ctx.params.sessionId, () => agent.unstable_forkSession(ctx.params)),
+    )
     .onRequest(methods.agent.session.list, (ctx) => agent.listSessions(ctx.params))
     .onRequest(methods.agent.session.delete, (ctx) => agent.deleteSession(ctx.params))
     .onRequest(methods.agent.session.resume, (ctx) => agent.resumeSession(ctx.params))
